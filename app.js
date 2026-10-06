@@ -1,0 +1,314 @@
+/* AXIS Allocation Estimator — unofficial, read-only.
+ * On-chain data: Axis AttemptRegistry on Base (verified contract).
+ *   getUserRecordCount(address) 0xc5c0498c
+ *   getUserRecords(address)     0x51096b02
+ *   totalRecords()              0x125f8974
+ *   records(uint256)            0x34461067 -> (dataId, taskId, user, score, simulationTime, timestamp, invalidated)
+ *   event RecordSubmitted(uint256 indexed dataId, uint256 indexed taskId, address indexed user, uint256 score, uint256 simulationTime)
+ */
+(() => {
+  "use strict";
+
+  // ------------------------------------------------------------------ config
+  const REGISTRY = "0xf91a90baa9e044da084df369445a59d859d640db";
+  const RPCS = ["https://mainnet.base.org", "https://base-rpc.publicnode.com", "https://base.llamarpc.com"];
+  const SEL = { count: "0xc5c0498c", ids: "0x51096b02", total: "0x125f8974", record: "0x34461067" };
+  const TOPIC_SUBMITTED = "0x6d77e907890f072253fbef2eb8d17cd30e09e409799f01195372185adc5313fd";
+  const POOL = 50_000_000;          // fixed 5% of 1B supply
+  const SALE_PRICE = 0.10;
+  const CONTRIBUTORS = 196_111;     // sale page stat, Sept 28 2026
+  const SAMPLE_SIZE = 150;          // recent records sampled for score / invalid rate
+  const STORE_KEY = "axis-estimator-v1";
+
+  // ------------------------------------------------------------------ state
+  const state = {
+    totalRecords: null,
+    netAvgScore: null,
+    scan: null,            // { wallet, count, validCount, avgScore, hours, first, last }
+    lastResult: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n, d = 0) => (n == null || !isFinite(n) ? "—" : n.toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d }));
+  const pct = (n, d = 4) => (n == null || !isFinite(n) ? "—" : `${(n * 100).toFixed(d)}%`);
+  const num = (el) => { const v = parseFloat(String(el.value).replace(/[, _]/g, "")); return isFinite(v) ? v : 0; };
+  const pad = (hex) => hex.replace(/^0x/, "").toLowerCase().padStart(64, "0");
+  const words = (hex) => (hex || "0x").slice(2).match(/.{64}/g) || [];
+  const toInt = (w) => (w ? parseInt(w, 16) : 0);
+  const shortAddr = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
+  const date = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : "—");
+
+  // ------------------------------------------------------------------ rpc
+  let rpcIndex = 0;
+  async function post(body) {
+    let lastErr;
+    for (let i = 0; i < RPCS.length; i++) {
+      const url = RPCS[(rpcIndex + i) % RPCS.length];
+      try {
+        const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        rpcIndex = (rpcIndex + i) % RPCS.length;
+        return json;
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error("All RPCs failed");
+  }
+  async function rpc(method, params) {
+    const j = await post({ jsonrpc: "2.0", id: 1, method, params });
+    if (j.error) throw new Error(j.error.message || "RPC error");
+    return j.result;
+  }
+  async function rpcBatch(calls, chunk = 25) {
+    const out = [];
+    for (let i = 0; i < calls.length; i += chunk) {
+      const part = calls.slice(i, i + chunk).map((c, k) => ({ jsonrpc: "2.0", id: i + k, method: c[0], params: c[1] }));
+      const res = await post(part);
+      const arr = Array.isArray(res) ? res : [res];
+      arr.sort((a, b) => a.id - b.id).forEach((r) => out.push(r.result ?? null));
+    }
+    return out;
+  }
+  const ethCall = (data) => rpc("eth_call", [{ to: REGISTRY, data }, "latest"]);
+
+  // ------------------------------------------------------------------ network stats
+  async function loadNetwork() {
+    try {
+      const [total, blockHex] = await Promise.all([ethCall(SEL.total), rpc("eth_blockNumber", [])]);
+      state.totalRecords = toInt(words(total)[0]);
+      const block = parseInt(blockHex, 16);
+
+      const logs = await rpc("eth_getLogs", [{ address: REGISTRY, fromBlock: "0x" + (block - 300).toString(16), toBlock: blockHex, topics: [TOPIC_SUBMITTED] }]);
+      const scores = (logs || []).map((l) => toInt(words(l.data)[0])).filter((s) => s >= 0 && s <= 1000);
+      if (scores.length) {
+        state.netAvgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  // ------------------------------------------------------------------ wallet scan
+  async function scanWallet() {
+    const input = $("wallet-input"), hint = $("wallet-hint"), btn = $("scan-btn");
+    const wallet = input.value.trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(wallet)) {
+      input.classList.add("invalid");
+      hint.textContent = "That doesn't look like a valid 0x… wallet address.";
+      return null;
+    }
+    input.classList.remove("invalid");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Scanning';
+    hint.textContent = "Reading AttemptRegistry on Base…";
+    try {
+      const idsHex = await ethCall(SEL.ids + pad(wallet));
+      const w = words(idsHex);
+      const len = toInt(w[1]);
+      const ids = w.slice(2, 2 + len).map((x) => BigInt("0x" + x));
+      let validCount = 0, avgScore = null, hours = 0, first = null, last = null;
+
+      if (len > 0) {
+        const recent = ids.slice(-SAMPLE_SIZE);
+        const sample = [ids[0], ...recent.filter((id) => id !== ids[0])];
+        const recs = await rpcBatch(sample.map((id) => ["eth_call", [{ to: REGISTRY, data: SEL.record + pad(id.toString(16)) }, "latest"]]));
+        const parsed = recs.filter(Boolean).map((r) => {
+          const x = words(r);
+          return { score: toInt(x[3]), sim: toInt(x[4]), ts: toInt(x[5]), invalid: toInt(x[6]) === 1 };
+        });
+        first = parsed[0]?.ts || null;
+        const rs = parsed.length > 1 ? parsed.slice(1) : parsed;
+        last = rs.reduce((m, r) => Math.max(m, r.ts), 0) || null;
+        const valid = rs.filter((r) => !r.invalid);
+        const invalidRate = rs.length ? 1 - valid.length / rs.length : 0;
+        validCount = Math.round(len * (1 - invalidRate));
+        avgScore = valid.length ? valid.reduce((a, r) => a + r.score, 0) / valid.length : null;
+        const avgSimMs = valid.length ? valid.reduce((a, r) => a + r.sim, 0) / valid.length : 0;
+        hours = (avgSimMs * validCount) / 3_600_000;
+      }
+
+      state.scan = { wallet, count: len, validCount, avgScore, hours, first, last };
+      $("r-count").textContent = fmt(len);
+      $("r-valid").textContent = fmt(validCount);
+      $("r-score").textContent = fmt(avgScore, 1);
+      $("r-hours").textContent = fmt(hours, 1);
+      $("r-first").textContent = date(first);
+      $("r-last").textContent = date(last);
+      $("scan-result").hidden = false;
+      hint.textContent = len ? `Found ${fmt(len)} on-chain trajectories (score/validity sampled from latest ${Math.min(len, SAMPLE_SIZE)}).`
+                             : "No trajectories recorded for this wallet. Check it's the wallet linked to your Axis Hub account.";
+      save();
+      return state.scan;
+    } catch (e) {
+      console.error(e);
+      hint.textContent = "Scan failed (RPC busy). Try again in a few seconds.";
+      return null;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Scan chain";
+    }
+  }
+
+  // ------------------------------------------------------------------ settings & persistence
+  const settings = () => ({
+    wp: 0.95, wt: 0.05,
+    mult: { none: 1, x: 1.1, y: 1.2, z: 1.3 },
+    avg: 1.15,
+  });
+  const role = () => (document.querySelector('input[name="role"]:checked') || {}).value || "none";
+
+  function save() {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify({
+        wallet: $("wallet-input").value, hub: $("hub-username").value, discord: $("discord-username").value,
+        role: role(), userPoints: $("total-points").value,
+      }));
+    } catch { /* storage unavailable */ }
+  }
+  function load() {
+    let s = null;
+    try { s = JSON.parse(localStorage.getItem(STORE_KEY)); } catch { /* ignore */ }
+    if (!s) return;
+    $("wallet-input").value = s.wallet || "";
+    $("hub-username").value = s.hub || "";
+    $("discord-username").value = s.discord || "";
+    const r = document.querySelector(`input[name="role"][value="${s.role}"]`); if (r) r.checked = true;
+    if (s.userPoints !== undefined) $("total-points").value = s.userPoints;
+  }
+
+  // ------------------------------------------------------------------ model
+  function estimate() {
+    const cfg = settings();
+    const userPts = num($("total-points"));
+    const netPts = 36000000;
+    const pointsShare = userPts > 0 && netPts > 0 ? Math.min(1, userPts / netPts) : null;
+
+    const scan = state.scan;
+    const trajShare = scan && state.totalRecords ? scan.validCount / state.totalRecords : null;
+    let quality = 1;
+    if (scan && scan.avgScore != null && state.netAvgScore) quality = Math.min(1.5, Math.max(0.5, scan.avgScore / state.netAvgScore));
+
+    let wp = pointsShare != null ? cfg.wp : 0;
+    let wt = trajShare != null ? cfg.wt : 0;
+    if (wp + wt === 0) { if (pointsShare != null) wp = 1; else if (trajShare != null) wt = 1; else return null; }
+    const base = (wp * (pointsShare || 0) + wt * (trajShare || 0) * quality) / (wp + wt);
+
+    const r = role();
+    const roleMult = cfg.mult[r] || 1;
+    const share = Math.min(1, (base * roleMult) / cfg.avg);
+    const alloc = POOL * share;
+
+    // rough rank via Pareto (80/20) model of trajectory counts across contributors
+    let rank = null;
+    const effTraj = trajShare != null ? scan.validCount : (pointsShare != null && state.totalRecords ? pointsShare * state.totalRecords : null);
+    if (effTraj && state.totalRecords) {
+      const alpha = 1.16, mean = state.totalRecords / CONTRIBUTORS, xm = (mean * (alpha - 1)) / alpha;
+      const tail = effTraj <= xm ? 1 : Math.pow(xm / effTraj, alpha);
+      rank = { pct: tail, pos: Math.max(1, Math.round(tail * CONTRIBUTORS)) };
+    }
+    return { alloc, low: alloc * 0.6, high: alloc * 1.4, pointsShare, trajShare, quality, roleMult, r, share, rank };
+  }
+
+  // ------------------------------------------------------------------ rendering
+  function animateNumber(el, to) {
+    const from = parseFloat(el.dataset.v || "0"), t0 = performance.now(), dur = 900;
+    el.dataset.v = to;
+    const step = (t) => {
+      const k = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - k, 3);
+      el.textContent = fmt(from + (to - from) * e);
+      if (k < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  function renderResult(res) {
+    $("results-empty").hidden = true;
+    $("results-body").hidden = false;
+    const ident = $("identity");
+    const roleNames = { none: "No role", x: "X Axis", y: "Y Axis", z: "Z Axis" };
+    const tags = [];
+    if (state.scan) tags.push(`<span class="tag">${shortAddr(state.scan.wallet)}</span>`);
+    if ($("hub-username").value.trim()) tags.push(`<span class="tag">Hub: ${escapeHtml($("hub-username").value.trim())}</span>`);
+    if ($("discord-username").value.trim()) tags.push(`<span class="tag">Discord: ${escapeHtml($("discord-username").value.trim())}</span>`);
+    tags.push(`<span class="tag role-tag ${res.r === "z" ? "z" : ""}">${roleNames[res.r]} · ${res.roleMult.toFixed(2)}×</span>`);
+    ident.innerHTML = tags.join("");
+
+    animateNumber($("alloc-value"), res.alloc);
+    $("alloc-low").textContent = fmt(res.low);
+    $("alloc-high").textContent = fmt(res.high);
+    $("alloc-usd").textContent = "$" + fmt(res.alloc * SALE_PRICE);
+    $("b-points").textContent = pct(res.pointsShare);
+    $("b-traj").textContent = pct(res.trajShare);
+    $("b-quality").textContent = `${res.quality.toFixed(2)}×`;
+    $("b-role").textContent = `${res.roleMult.toFixed(2)}×`;
+    $("b-pool").textContent = pct(res.share);
+    $("b-rank").textContent = res.rank ? `Top ~${(res.rank.pct * 100).toFixed(res.rank.pct < 0.01 ? 2 : 1)}% (#${fmt(res.rank.pos)})` : "—";
+    renderVesting(res.alloc);
+  }
+
+  function schedule() {
+    return Array.from({ length: 7 }, (_, m) => {
+      const tge = 0.5;
+      const lin = m === 0 ? 0 : 0.5 * (m / 6);
+      return { m, tge, lin };
+    });
+  }
+
+  function renderVesting(total) {
+    const rows = schedule();
+    const W = 520, H = 200, padL = 6, padB = 22, gap = 6;
+    const bw = (W - padL - gap * 6) / 7;
+    const ch = H - padB - 14;
+    let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><defs>
+      <linearGradient id="gv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8b7bff"/><stop offset="1" stop-color="#5b4bd6"/></linearGradient>
+      <linearGradient id="gl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5dffc4"/><stop offset="1" stop-color="#1fae7f"/></linearGradient></defs>`;
+    rows.forEach((r, i) => {
+      const x = padL + i * (bw + gap);
+      const hT = ch * r.tge, hL = ch * r.lin;
+      const yT = H - padB - hT, yL = yT - hL;
+      svg += `<rect class="bar" x="${x}" y="${yT}" width="${bw}" height="${hT}" rx="3" fill="url(#gv)"><title>Month ${r.m}: ${fmt(total * (r.tge + r.lin))} AXIS unlocked</title></rect>`;
+      if (hL > 0) svg += `<rect class="bar" x="${x}" y="${yL}" width="${bw}" height="${hL}" rx="3" fill="url(#gl)"><title>Month ${r.m}: ${fmt(total * (r.tge + r.lin))} AXIS unlocked</title></rect>`;
+      svg += `<text x="${x + bw / 2}" y="${H - 6}" text-anchor="middle">${r.m === 0 ? "TGE" : "M" + r.m}</text>`;
+      if ([0, 6, 12].includes(r.m)) svg += `<text class="val" x="${x + bw / 2}" y="${yL - 4}" text-anchor="middle">${compact(total * (r.tge + r.lin))}</text>`;
+    });
+    svg += "</svg>";
+    $("vesting-chart").innerHTML = svg;
+    const t = rows[0].tge;
+    const monthly = (total * (1 - t)) / 6;
+    $("v-summary").textContent = `${fmt(total * t)} at TGE · then ${fmt(monthly)}/mo linear over 6 months`;
+  }
+
+  const compact = (n) => (n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : fmt(n));
+  const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  // ------------------------------------------------------------------ events
+  async function onSubmit(ev) {
+    ev.preventDefault();
+    const btn = $("estimate-btn");
+    btn.disabled = true;
+    const wallet = $("wallet-input").value.trim();
+    if (wallet && (!state.scan || state.scan.wallet.toLowerCase() !== wallet.toLowerCase())) await scanWallet();
+    const res = estimate();
+    btn.disabled = false;
+    if (!res) {
+      $("wallet-hint").textContent = "Enter a wallet to scan and/or at least one epoch's points.";
+      $("wallet-input").focus();
+      return;
+    }
+    state.lastResult = res;
+    renderResult(res);
+    save();
+    if (window.innerWidth < 960) $("results").scrollIntoView({ behavior: "smooth" });
+  }
+
+  function init() {
+    load();
+    $("estimator-form").addEventListener("submit", onSubmit);
+    $("scan-btn").addEventListener("click", scanWallet);
+    $("wallet-input").addEventListener("input", (e) => e.target.classList.remove("invalid"));
+    document.querySelectorAll("#hub-username, #discord-username, #total-points, input[name='role']").forEach((el) => el.addEventListener("change", save));
+    loadNetwork();
+  }
+
+  document.addEventListener("DOMContentLoaded", init);
+})();

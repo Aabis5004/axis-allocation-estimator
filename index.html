@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AXIS Allocation Estimator | Points, Trajectories &amp; Discord Role</title>
+  <meta name="description" content="Estimate your $AXIS contributor airdrop allocation from your on-chain Axis Robotics trajectories, epoch points and Discord role (X / Y / Z Axis). Unofficial community tool." />
+  <meta name="theme-color" content="#06070b" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="bg-orbs" aria-hidden="true"><span></span><span></span><span></span></div>
+  <div class="bg-grid" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="brand" href="#" aria-label="AXIS Allocation Estimator home">
+        <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+          <g stroke="url(#gm)" stroke-width="4" stroke-linecap="round">
+            <line x1="20" y1="4" x2="20" y2="36" /><line x1="6" y1="12" x2="34" y2="28" /><line x1="6" y1="28" x2="34" y2="12" />
+          </g>
+          <defs><linearGradient id="gm" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5dffc4" /><stop offset="1" stop-color="#8b7bff" /></linearGradient></defs>
+        </svg>
+        <span>AXIS<b>Estimator</b></span>
+      </a>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="hero">
+      <p class="eyebrow">Unofficial community tool · Base mainnet</p>
+      <h1>Estimate your <span class="grad">$AXIS</span> allocation</h1>
+      <p class="lede">Paste your wallet to pull your <b>verified trajectories</b> straight from the Axis AttemptRegistry on Base, add your <b>total points</b> and <b>Discord role</b>, and see an estimated share of the contributor pool with its unlock schedule.</p>
+    </section>
+
+    <section class="grid-main">
+      <!-- INPUTS -->
+      <form class="card glass" id="estimator-form" autocomplete="off">
+        <div class="card-head"><span class="step">01</span><h2>Your contributor profile</h2></div>
+
+        <label class="field" for="wallet-input">
+          <span class="lbl">Wallet address <em>(used on Axis Hub)</em></span>
+          <div class="input-row">
+            <input id="wallet-input" type="text" placeholder="0x…" spellcheck="false" />
+            <button type="button" class="btn btn-ghost" id="scan-btn">Scan chain</button>
+          </div>
+          <span class="hint" id="wallet-hint">Reads getUserRecordCount() and samples your record scores.</span>
+        </label>
+
+        <div class="scan-result" id="scan-result" hidden>
+          <div><span class="k">Trajectories</span><span class="v" id="r-count">—</span></div>
+          <div><span class="k">Est. valid</span><span class="v" id="r-valid">—</span></div>
+          <div><span class="k">Avg score</span><span class="v" id="r-score">—</span></div>
+          <div><span class="k">Sim. hours</span><span class="v" id="r-hours">—</span></div>
+          <div><span class="k">First record</span><span class="v" id="r-first">—</span></div>
+          <div><span class="k">Latest record</span><span class="v" id="r-last">—</span></div>
+        </div>
+
+        <div class="row-2">
+          <label class="field" for="hub-username">
+            <span class="lbl">Axis Hub username <em>(optional)</em></span>
+            <input id="hub-username" type="text" placeholder="e.g. robo_arif" />
+          </label>
+          <label class="field" for="discord-username">
+            <span class="lbl">Discord name <em>(optional)</em></span>
+            <input id="discord-username" type="text" placeholder="e.g. arif#0001" />
+          </label>
+        </div>
+
+        <fieldset class="field">
+          <legend class="lbl">Discord role</legend>
+          <div class="roles" id="role-picker">
+            <label class="role" data-role="none"><input type="radio" name="role" value="none" id="role-none" checked /><span class="r-name">No role</span></label>
+            <label class="role" data-role="x"><input type="radio" name="role" value="x" id="role-x" /><span class="r-name">X Axis</span></label>
+            <label class="role" data-role="y"><input type="radio" name="role" value="y" id="role-y" /><span class="r-name">Y Axis</span></label>
+            <label class="role role-top" data-role="z"><input type="radio" name="role" value="z" id="role-z" /><span class="r-name">Z Axis</span></label>
+          </div>
+          <span class="hint">Discord roles can't be read from a username, so pick yours. Z Axis is the highest.</span>
+        </fieldset>
+
+        <div class="card-head sub"><span class="step">02</span><h2>Total points</h2></div>
+        <label class="field" for="total-points">
+          <span class="lbl">Your points</span>
+          <input id="total-points" type="text" inputmode="numeric" placeholder="e.g. 12,500" value="" />
+        </label>
+
+        <button type="submit" class="btn btn-primary" id="estimate-btn">Estimate my allocation <span aria-hidden="true">→</span></button>
+      </form>
+
+      <!-- RESULTS -->
+      <section class="card glass results" id="results" aria-live="polite">
+        <div class="card-head"><span class="step">03</span><h2>Your estimate</h2></div>
+
+        <div class="empty" id="results-empty">
+          <div class="empty-mark" aria-hidden="true">✳</div>
+          <p>Scan your wallet and/or enter your epoch points, then press <b>Estimate</b>.</p>
+        </div>
+
+        <div id="results-body" hidden>
+          <div class="identity" id="identity"></div>
+          <div class="big">
+            <span class="k">Estimated allocation</span>
+            <span class="v"><span id="alloc-value">0</span> <small>AXIS</small></span>
+            <span class="range">Range <b id="alloc-low">0</b> – <b id="alloc-high">0</b> AXIS · ≈ <b id="alloc-usd">$0</b> at $0.10 sale price</span>
+          </div>
+
+          <div class="breakdown">
+            <div class="b-row"><span>Points share</span><span id="b-points">—</span></div>
+            <div class="b-row"><span>Trajectory share</span><span id="b-traj">—</span></div>
+            <div class="b-row"><span>Quality factor</span><span id="b-quality">—</span></div>
+            <div class="b-row"><span>Role multiplier</span><span id="b-role">—</span></div>
+            <div class="b-row"><span>Share of pool</span><span id="b-pool">—</span></div>
+            <div class="b-row"><span>Rank estimate</span><span id="b-rank">—</span></div>
+          </div>
+
+          <div class="vesting">
+            <div class="v-head">
+              <h3>Unlock schedule</h3>
+              <span class="badge" style="background:var(--glass-2);padding:4px 10px;border-radius:20px;font-size:12px;color:var(--t2);border:1px solid var(--line);">50% TGE + 6 Months Linear</span>
+            </div>
+            <div class="chart" id="vesting-chart" role="img" aria-label="Cumulative unlock chart"></div>
+            <div class="v-legend"><span><i class="sw sw-tge"></i>TGE unlock</span><span><i class="sw sw-lin"></i>Linear unlock</span><span class="muted" id="v-summary"></span></div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
